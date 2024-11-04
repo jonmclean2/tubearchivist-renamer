@@ -1,0 +1,17 @@
+{
+    "plex_url": "http://localhost:32400",
+    "plex_token": "YOUR_PLEX_TOKEN_HERE",
+    "library_section_id": "1",
+    "directory_paths": "/mnt/user/media/tubearchivist/",
+    "scan_recursively": true,
+    "title_length_limit": 50,
+    "log_file_path": "/mnt/user/media/tubearchivist/renamed_files.log",
+    "wait_timer": 10,
+    "schedule": "",
+    "max_retries": 3,
+    "retry_delay": 5,
+    "filename_pattern": "{title}.mp4",
+    "max_log_entries": 1000,
+    "metadata_log": "/mnt/user/media/tubearchivist/renamed_files.log"
+  }
+  
