@@ -39,6 +39,22 @@ debug_mode = args.debug
 setup_mode = args.setup
 dry_run = args.dry_run
 
+# Determine script directory and config path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(script_dir, "config.json")
+
+# Load configuration from config.json
+try:
+    with open(config_path) as f:
+        config = json.load(f)
+    print("Configuration loaded successfully:", config)  # Debug statement
+except FileNotFoundError:
+    print("Error: config.json file not found.")
+    exit(1)
+except json.JSONDecodeError:
+    print("Error: config.json file is not properly formatted.")
+    exit(1)
+
 # Default configuration values
 default_config = {
     "plex_url": "http://localhost:32400",
@@ -54,19 +70,18 @@ default_config = {
     "retry_delay": 5,
     "filename_pattern": "{title}.mp4",
     "max_log_entries": 1000,
-    "metadata_log": "/mnt/user/media/tubearchivist/renamed_files.log"  # Log to track processed files
+    "metadata_log": "/mnt/user/media/tubearchivist/renamed_files.log"
 }
 
 def create_default_config():
     """Create config.json with default values and ensure required libraries are installed."""
-    config_file_path = "config.json"
-    if os.path.exists(config_file_path):
+    if os.path.exists(config_path):
         overwrite = input("config.json already exists. Overwrite? (y/n): ").strip().lower()
         if overwrite != 'y':
             print("Setup canceled. Using existing config.json.")
             return
     
-    with open(config_file_path, "w") as f:
+    with open(config_path, "w") as f:
         json.dump(default_config, f, indent=4)
     print("config.json created with default values.")
     
@@ -88,8 +103,6 @@ def ensure_libraries_installed():
 
 def schedule_cron_job():
     """Add a cron job based on the schedule in config.json."""
-    with open("config.json") as f:
-        config = json.load(f)
     schedule = config.get("schedule", "").strip()
     
     if schedule:
@@ -128,11 +141,14 @@ def fetch_youtube_title(video_id, max_retries, retry_delay):
 
 def sanitize_filename(filename):
     """Remove invalid characters from a filename."""
-    return re.sub(r'[<>:"/\\|?*]', '_', filename)
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    if not sanitized.strip():
+        sanitized = "unnamed_file"
+    return sanitized
 
 def is_already_renamed(video_id):
     """Check if the video ID is already logged in renamed_files.log."""
-    metadata_log_path = Path(default_config["metadata_log"])
+    metadata_log_path = Path(config.get("metadata_log", "/tmp/renamed_files.log"))
     if not metadata_log_path.exists():
         return False
     with open(metadata_log_path, "r") as f:
@@ -140,12 +156,13 @@ def is_already_renamed(video_id):
 
 def log_renamed_file(video_id, new_name):
     """Log the renamed file in the metadata log to avoid reprocessing."""
-    metadata_log_path = Path(default_config["metadata_log"])
+    metadata_log_path = Path(config.get("metadata_log", "/tmp/renamed_files.log"))
     with open(metadata_log_path, "a") as f:
         f.write(f"{video_id},{new_name}\n")
 
 def trim_title(title):
     """Trim the title to the specified length and ensure it ends on a word boundary."""
+    title_length_limit = config.get("title_length_limit", 50)
     if len(title) <= title_length_limit:
         return title
     trimmed = title[:title_length_limit].rsplit(' ', 1)[0]
@@ -161,6 +178,9 @@ def apply_filename_pattern(pattern, title, video_id):
 
 def rotate_log_file():
     """Keep only the last N entries in the log file."""
+    log_file_path = config.get("log_file_path", "/tmp/logfile.log")
+    max_log_entries = config.get("max_log_entries", 1000)
+    
     with open(log_file_path, "r+") as log_file:
         lines = log_file.readlines()
         if len(lines) > max_log_entries:
@@ -188,6 +208,10 @@ def rename_file(file_path, new_name):
 # Function to trigger a Plex library scan
 def trigger_plex_scan():
     """Trigger a scan on the specified Plex library section."""
+    plex_url = config.get("plex_url", "http://localhost:32400")
+    plex_token = config.get("plex_token", "")
+    library_section_id = config.get("library_section_id", "")
+    
     if not plex_token or not library_section_id:
         print("Plex token or library section ID missing in config.json. Skipping Plex scan.")
         return
@@ -195,7 +219,7 @@ def trigger_plex_scan():
     headers = {
         "X-Plex-Token": plex_token
     }
-    scan_url = f"{plex_url}/library/sections/{library_section_id}/refresh"
+    scan_url = f"{plex_url.rstrip('/')}/library/sections/{library_section_id}/refresh"
     
     try:
         response = requests.get(scan_url, headers=headers)
@@ -211,6 +235,12 @@ def trigger_plex_scan():
 
 def process_directory(path):
     """Process .mp4 files in a directory according to the configuration."""
+    scan_recursively = config.get("scan_recursively", True)
+    filename_pattern = config.get("filename_pattern", "{title}.mp4")
+    wait_timer = config.get("wait_timer", 10)
+    max_retries = config.get("max_retries", 3)
+    retry_delay = config.get("retry_delay", 5)
+
     for root, _, files in os.walk(path) if scan_recursively else [(path, [], os.listdir(path))]:
         for file in files:
             if file.endswith(".mp4"):
@@ -252,14 +282,7 @@ if setup_mode:
 
 # Load settings from config.json
 directory_paths = config.get("directory_paths", "").split(",")
-scan_recursively = config.get("scan_recursively", True)
-title_length_limit = config.get("title_length_limit", 50)
 log_file_path = config.get("log_file_path", "/mnt/user/media/tubearchivist/renamed_files.log")
-wait_timer = config.get("wait_timer", 10)
-max_retries = config.get("max_retries", 3)
-retry_delay = config.get("retry_delay", 5)
-filename_pattern = config.get("filename_pattern", "{title}.mp4")
-max_log_entries = config.get("max_log_entries", 1000)
 
 # Set up logging with debug level based on the mode
 log_level = logging.DEBUG if debug_mode else logging.INFO
