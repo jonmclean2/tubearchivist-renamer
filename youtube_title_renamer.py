@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 import argparse
 import subprocess
+import shutil
 import re
 
 # CONFIGURATION GUIDE:
@@ -20,11 +21,12 @@ import re
 # - scan_recursively: Set to true to enable recursive scanning of subdirectories; set to false to scan only top-level directories.
 # - title_length_limit: Limit on the number of characters for the video title when renaming files (recommended: 50).
 # - log_file_path: Path to the log file where rename actions will be recorded.
+# - destination_folder: Directory where processed (copied) files will be saved.
 # - wait_timer: Time in seconds to wait between processing each video (recommended: 10).
 # - schedule: Optional cron-formatted string for automatic scheduling.
 # - max_retries: Maximum number of attempts to retry fetching the YouTube title (recommended: 3).
 # - retry_delay: Delay in seconds between retry attempts (recommended: 5).
-# - filename_pattern: Pattern for renaming files. Supported placeholders: {title}, {video_id}, {date}.
+# - filename_pattern: Pattern for renaming files. Supported placeholders: {title}, {id}, {date}, {original}, {channel_name}.
 # - max_log_entries: Number of log entries to retain in the log file.
 
 # Parse command-line arguments
@@ -64,6 +66,7 @@ default_config = {
     "scan_recursively": True,
     "title_length_limit": 50,
     "log_file_path": "/mnt/user/media/tubearchivist/renamed_files.log",
+    "destination_folder": "",  # Default to empty; script will create 'processed_files' if not specified
     "wait_timer": 10,
     "schedule": "",
     "max_retries": 3,
@@ -139,6 +142,23 @@ def fetch_youtube_title(video_id, max_retries, retry_delay):
     logging.warning(f"Failed to fetch title for video ID {video_id} after {max_retries} attempts")
     return None
 
+def fetch_channel_name(channel_id):
+    """Fetch the channel name using the channel ID."""
+    url = f"https://www.youtube.com/results?search_query={channel_id}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        channel_name_tag = soup.find("meta", property="og:title")
+        if channel_name_tag:
+            channel_name = channel_name_tag["content"]
+            if debug_mode:
+                print(f"[DEBUG] Channel name extracted: {channel_name}")
+            return sanitize_filename(channel_name)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch channel name for {channel_id}: {e}")
+    return "UnknownChannel"
+
 def sanitize_filename(filename):
     """Remove invalid characters from a filename."""
     sanitized = re.sub(r'[<>:"/\\|?*]', '_', filename)
@@ -146,35 +166,42 @@ def sanitize_filename(filename):
         sanitized = "unnamed_file"
     return sanitized
 
-def is_already_renamed(video_id):
-    """Check if the video ID is already logged in renamed_files.log."""
-    metadata_log_path = Path(config.get("metadata_log", "/tmp/renamed_files.log"))
-    if not metadata_log_path.exists():
-        return False
-    with open(metadata_log_path, "r") as f:
-        return any(video_id in line for line in f)
-
-def log_renamed_file(video_id, new_name):
-    """Log the renamed file in the metadata log to avoid reprocessing."""
-    metadata_log_path = Path(config.get("metadata_log", "/tmp/renamed_files.log"))
-    with open(metadata_log_path, "a") as f:
-        f.write(f"{video_id},{new_name}\n")
-
 def trim_title(title):
     """Trim the title to the specified length and ensure it ends on a word boundary."""
     title_length_limit = config.get("title_length_limit", 50)
     if len(title) <= title_length_limit:
         return title
-    trimmed = title[:title_length_limit].rsplit(' ', 1)[0]
+    trimmed = title[:title_length_limit].rsplit(' ', 1)[0]  # Trim to word boundary
     if debug_mode:
         print(f"[DEBUG] Trimmed title: {trimmed}")
     return trimmed
 
-def apply_filename_pattern(pattern, title, video_id):
+def apply_filename_pattern(pattern, title, video_id, original, channel_name):
     """Apply the filename pattern from config.json."""
     date_str = datetime.now().strftime("%Y%m%d")
     sanitized_title = sanitize_filename(title)
-    return pattern.format(title=sanitized_title, video_id=video_id, date=date_str)
+    return pattern.format(title=sanitized_title, id=video_id, date=date_str, original=original, channel_name=channel_name)
+
+def copy_and_rename_file(file_path, new_name, channel_name):
+    """Copy the file to the destination directory with a new name within a channel-specific subfolder."""
+    # Determine destination folder
+    destination_folder = config.get("destination_folder", "")
+    if not destination_folder:
+        destination_folder = os.path.join(script_dir, "processed_files")
+
+    # Create channel-specific folder in the destination
+    channel_folder = Path(destination_folder) / channel_name
+    os.makedirs(channel_folder, exist_ok=True)
+
+    destination_path = channel_folder / new_name
+    if dry_run:
+        print(f"[DRY RUN] Would copy '{file_path}' to '{destination_path}'")
+        return
+    
+    shutil.copy(file_path, destination_path)
+    logging.info(f"Copied '{file_path}' to '{destination_path}'")
+    if debug_mode:
+        print(f"[DEBUG] Copied '{file_path}' to '{destination_path}'")
 
 def rotate_log_file():
     """Keep only the last N entries in the log file."""
@@ -188,51 +215,6 @@ def rotate_log_file():
             log_file.writelines(lines[-max_log_entries:])
             log_file.truncate()
 
-def rename_file(file_path, new_name):
-    """Rename the file with a unique name to avoid conflicts."""
-    if dry_run:
-        print(f"[DRY RUN] Would rename '{file_path}' to '{new_name}'")
-        return
-    
-    directory = file_path.parent
-    new_file_path = directory / new_name
-    counter = 1
-    while new_file_path.exists():
-        new_file_path = directory / f"{new_name}_{counter}.mp4"
-        counter += 1
-    os.rename(file_path, new_file_path)
-    logging.info(f"Renamed '{file_path}' to '{new_file_path}'")
-    if debug_mode:
-        print(f"[DEBUG] Renamed '{file_path}' to '{new_file_path}'")
-
-# Function to trigger a Plex library scan
-def trigger_plex_scan():
-    """Trigger a scan on the specified Plex library section."""
-    plex_url = config.get("plex_url", "http://localhost:32400")
-    plex_token = config.get("plex_token", "")
-    library_section_id = config.get("library_section_id", "")
-    
-    if not plex_token or not library_section_id:
-        print("Plex token or library section ID missing in config.json. Skipping Plex scan.")
-        return
-
-    headers = {
-        "X-Plex-Token": plex_token
-    }
-    scan_url = f"{plex_url.rstrip('/')}/library/sections/{library_section_id}/refresh"
-    
-    try:
-        response = requests.get(scan_url, headers=headers)
-        if response.status_code == 200:
-            print("Triggered Plex library scan successfully.")
-            logging.info("Triggered Plex library scan successfully.")
-        else:
-            print(f"Failed to trigger Plex scan. Status code: {response.status_code}")
-            logging.error(f"Failed to trigger Plex scan. Status code: {response.status_code}")
-    except requests.RequestException as e:
-        print(f"Error triggering Plex scan: {e}")
-        logging.error(f"Error triggering Plex scan: {e}")
-
 def process_directory(path):
     """Process .mp4 files in a directory according to the configuration."""
     scan_recursively = config.get("scan_recursively", True)
@@ -242,38 +224,34 @@ def process_directory(path):
     retry_delay = config.get("retry_delay", 5)
 
     for root, _, files in os.walk(path) if scan_recursively else [(path, [], os.listdir(path))]:
+        # Extract the channel ID from the folder name
+        channel_id = Path(root).name
+        channel_name = fetch_channel_name(channel_id)
+
         for file in files:
             if file.endswith(".mp4"):
                 file_path = Path(root) / file
                 video_id = file_path.stem
+                original_name = file_path.stem
                 print(f"\nProcessing video ID: {video_id}")
-
-                # Check if the file has already been renamed
-                if is_already_renamed(video_id):
-                    print(f"[INFO] Skipping '{file}' (already renamed).")
-                    continue
 
                 # Fetch and trim the title
                 title = fetch_youtube_title(video_id, max_retries, retry_delay)
                 if title:
                     trimmed_title = trim_title(title)
-                    new_name = apply_filename_pattern(filename_pattern, trimmed_title, video_id)
+                    new_name = apply_filename_pattern(filename_pattern, trimmed_title, video_id, original_name, channel_name)
 
                     if interactive_mode:
                         # Confirm each rename in interactive mode
-                        confirm = input(f"Rename '{file}' to '{new_name}'? (y/n): ").strip().lower()
+                        confirm = input(f"Copy and rename '{file}' to '{new_name}'? (y/n): ").strip().lower()
                         if confirm != 'y':
                             print("Skipping file.")
                             continue
 
-                    rename_file(file_path, new_name)
-                    print(f"Renamed '{file}' to '{new_name}'")
-                    log_renamed_file(video_id, new_name)
+                    copy_and_rename_file(file_path, new_name, channel_name)
+                    print(f"Copied and renamed '{file}' to '{new_name}'")
                     rotate_log_file()
                     time.sleep(wait_timer)
-
-    # Trigger Plex scan after processing all files in the directory
-    trigger_plex_scan()
 
 # Run setup if -s flag is provided
 if setup_mode:
